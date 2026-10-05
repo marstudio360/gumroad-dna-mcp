@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gumroad-dna": {
+      "command": "python",
+      "args": ["server.py"]
+    }
+  }
+}
