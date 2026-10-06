@@ -27,7 +27,7 @@ BASE_URL = "https://api.gumroad.com/v2"
 
 # This copy's version. Bump it when packaging; check_for_update compares it against
 # what the site currently publishes, so an installed copy can tell it is behind.
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 PRODUCT_SLUG = "gumroad"
 
 
