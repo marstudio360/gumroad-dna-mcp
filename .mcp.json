@@ -2,7 +2,8 @@
   "mcpServers": {
     "gumroad-dna": {
       "command": "python",
-      "args": ["server.py"]
+      "args": ["server.py"],
+      "env": { "GUMROAD_ACCESS_TOKEN": "<your token>" }
     }
   }
 }
