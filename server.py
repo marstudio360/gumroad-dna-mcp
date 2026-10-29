@@ -27,7 +27,7 @@ BASE_URL = "https://api.gumroad.com/v2"
 
 # This copy's version. Bump it when packaging; check_for_update compares it against
 # what the site currently publishes, so an installed copy can tell it is behind.
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 PRODUCT_SLUG = "gumroad"
 
 
@@ -122,6 +122,13 @@ def _post_json(endpoint: str, body: dict) -> dict:
     return r.json()
 
 
+def _put_json(endpoint: str, body: dict) -> dict:
+    r = requests.put(f"{BASE_URL}{endpoint}", headers={**_headers(), "Content-Type": "application/json"},
+                     json=body, timeout=180)
+    r.raise_for_status()
+    return r.json()
+
+
 def _direct_upload_image(path: str) -> str:
     """ActiveStorage direct upload (images/video ONLY) -> returns signed_blob_id. For covers/thumbnails."""
     data = open(path, "rb").read()
@@ -135,10 +142,23 @@ def _direct_upload_image(path: str) -> str:
     return resp.get("signed_id")
 
 
+def _all_products() -> list:
+    """Every product in the store. /products returns 10 per page: follow next_page_key, or the
+    store looks like it has 10 items when it has 90."""
+    out, key = [], None
+    for _ in range(200):
+        data = _get("/products", {"page_key": key} if key else None)
+        out.extend(data.get("products", []))
+        key = data.get("next_page_key")
+        if not key:
+            break
+    return out
+
+
 def _upload_product_file(path: str, content_type: str = "application/zip") -> str:
-    """Multipart-S3 upload for product files (any size/type) -> returns file_url for the create/update files array."""
-    data = open(path, "rb").read()
-    sz = len(data)
+    """Multipart-S3 upload for product files (any size/type) -> returns file_url for the create/update files array.
+    Reads one part at a time from disk, so multi-GB zips never sit whole in memory."""
+    sz = os.path.getsize(path)
     presign = _post("/files/presign", {"filename": os.path.basename(path), "file_size": sz,
                                        "content_type": content_type})
     uid, key, file_url = presign["upload_id"], presign["key"], presign["file_url"]
@@ -147,13 +167,21 @@ def _upload_product_file(path: str, content_type: str = "application/zip") -> st
     psize = -(-sz // n)  # ceil
     done = []
     try:
-        for pinfo in sorted(parts, key=lambda p: int(p["part_number"])):
-            pn = int(pinfo["part_number"])
-            chunk = data[(pn - 1) * psize: pn * psize]
-            pr = requests.put(pinfo["presigned_url"], data=chunk, timeout=900)
-            pr.raise_for_status()
-            done.append({"part_number": pn, "etag": (pr.headers.get("ETag") or "").strip('"')})
-    except requests.HTTPError:
+        with open(path, "rb") as fh:
+            for pinfo in sorted(parts, key=lambda p: int(p["part_number"])):
+                pn = int(pinfo["part_number"])
+                fh.seek((pn - 1) * psize)
+                chunk = fh.read(psize)
+                for attempt in range(3):
+                    try:
+                        pr = requests.put(pinfo["presigned_url"], data=chunk, timeout=900)
+                        pr.raise_for_status()
+                        break
+                    except (requests.ConnectionError, requests.Timeout):
+                        if attempt == 2:
+                            raise
+                done.append({"part_number": pn, "etag": (pr.headers.get("ETag") or "").strip('"')})
+    except (requests.HTTPError, requests.ConnectionError, requests.Timeout):
         _post("/files/abort", {"upload_id": uid, "key": key})
         raise
     comp = _post_json("/files/complete", {"upload_id": uid, "key": key, "parts": done})
@@ -264,10 +292,9 @@ def get_revenue_snapshot(period: str = "month") -> str:
 def list_products() -> str:
     """[FREE] All Gumroad products with price, sales count, and published status."""
     try:
-        data = _get("/products")
+        products = _all_products()
     except ValueError as e:
         return str(e)
-    products = data.get("products", [])
     if not products:
         return "No products found."
 
@@ -597,8 +624,9 @@ def create_product(name: str, price: float, description: str = "", file_path: st
         cents = int(round(price * 100))
         if file_path:
             file_url = _upload_product_file(file_path)
+            # published=false explicitly: without it Gumroad publishes the product the moment it is created.
             body = {"name": name, "native_type": "digital", "price": cents,
-                    "price_currency_type": "usd", "description": description,
+                    "price_currency_type": "usd", "description": description, "published": False,
                     "files": [{"id": "1", "url": file_url,
                                "display_name": os.path.splitext(os.path.basename(file_path))[0]}]}
             if tags:
@@ -606,7 +634,7 @@ def create_product(name: str, price: float, description: str = "", file_path: st
             result = _post_json("/products", body)
         else:
             payload = {"name": name, "native_type": "digital", "price": str(cents),
-                       "description": description}
+                       "description": description, "published": "false"}
             result = _post("/products", payload)
         p = result.get("product") or result
         pid = p.get("id")
@@ -658,8 +686,12 @@ def add_product_file(product_id: str, file_path: str, content_type: str = "appli
     try:
         file_url = _upload_product_file(file_path, content_type)
         name = os.path.splitext(os.path.basename(file_path))[0]
-        _put(f"/products/{product_id}",
-             {"files": [{"id": "1", "url": file_url, "display_name": name}]})
+        # JSON, like create_product: a nested files list sent as form data does not reach Gumroad as a list.
+        # Gumroad replaces the whole list with what is sent: existing files are kept by their id ONLY, and the
+        # new file goes WITHOUT an id (with a made-up id Gumroad silently drops it; verified 2026-10-28).
+        current = _get(f"/products/{product_id}").get("product", {}).get("files") or []
+        keep = [{"id": f.get("id")} for f in current if f.get("id")]
+        _put_json(f"/products/{product_id}", {"files": keep + [{"url": file_url, "display_name": name}]})
         return f"Attached {os.path.basename(file_path)} to {product_id}."
     except (ValueError, requests.HTTPError) as e:
         return f"Error: {e}"
